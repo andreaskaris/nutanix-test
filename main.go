@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"path"
 	"time"
@@ -65,7 +67,20 @@ func CreateNutanixClient(ctx context.Context, endpoint PrismEndpoint) (*nutanixc
 	return nutanixclientv3.NewV3Client(cred)
 }
 
+var nodeNameFlag = flag.String("node-name", "", "name of the node to update")
+var ipAddressAddFlag = flag.String("add-address", "", "add this ip address")
+var ipAddressRemoveFlag = flag.String("remove-address", "", "remove this ip address")
+
 func main() {
+	flag.Parse()
+
+	if *nodeNameFlag == "" {
+		klog.Fatal("Provide a node name")
+	}
+	if *ipAddressAddFlag != "" && *ipAddressRemoveFlag != "" {
+		klog.Fatal("Must provide exactly one, add-address or remove-address")
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		klog.Fatal(err)
@@ -97,36 +112,7 @@ func main() {
 		klog.Fatal(err)
 	}
 
-	// Question: what is host? It seems that we are only interested in VMs ...
-
-	/*
-		hostList, err := client.V3.ListAllHost()
-		if err != nil {
-			klog.Fatal(err)
-		}
-		for _, hostFromList := range hostList.Entities {
-			// All of that info is already part of the list request, but for our real implementation
-			// we must run the get request, so let's try that as well.
-			name := hostFromList.Spec.Name
-			uuid := hostFromList.Metadata.UUID
-			klog.Infof("Getting further info for host %s with UUID %s", name, *uuid)
-			host, err := client.V3.GetHost(*uuid)
-			if err != nil {
-				klog.Fatal(err)
-			}
-			nics := host.Status.Resources.HostNicsIDList
-			klog.Infof("Nic list is: %v", nics)
-			for _, nic := range nics {
-				klog.Info(nic)
-			}
-			nics = host.Spec.Resources.HostNicsIDList
-			klog.Infof("Nic list is: %v", nics)
-			for _, nic := range nics {
-				klog.Info(nic)
-			}
-		}*/
-
-	// https://www.nutanix.dev/api_references/prism-central-v3/#/1249f40c4f9db-get-a-list-of-existing-v-ms
+	// https://www.nutanix.dev/api_references/prism-central-v3/#/1249f40c4f9db-get-a-list-of-existing-vms
 	// Question: Do we have to read the status or the spec?
 	vmList, err := client.V3.ListAllVM("")
 	if err != nil {
@@ -136,6 +122,15 @@ func main() {
 		// All of that info is already part of the list request, but for our real implementation
 		// we must run the get request, so let's try that as well.
 		name := vmFromList.Spec.Name
+		if *name != *nodeNameFlag {
+			continue
+		}
+		resB, err := json.MarshalIndent(vmFromList, "", "    ")
+		if err != nil {
+			klog.Fatal(err)
+		}
+		klog.Infof("VM res: %s", resB)
+
 		uuid := vmFromList.Metadata.UUID
 		klog.Infof("Getting further info for VM %s with UUID %s", *name, *uuid)
 		vm, err := client.V3.GetVM(*uuid)
@@ -148,10 +143,57 @@ func main() {
 				ips = append(ips, *ip.IP)
 			}
 			klog.Infof("VM %s (uuid %s) interface %d has the following MAC %s and IP addresses %v", *name, *uuid, k, *nic.MacAddress, ips)
+			subnetRef := nic.SubnetReference
+			subnet, err := client.V3.GetSubnet(*subnetRef.UUID)
+			if err != nil {
+				klog.Fatal(err)
+			}
+			subnetName := subnet.Spec.Name
+			ipConfig := subnet.Spec.Resources.IPConfig
+			_, ipNet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", *ipConfig.SubnetIP, *ipConfig.PrefixLength))
+			if err != nil {
+				klog.Fatal(err)
+			}
+			klog.Infof("Attached subnet %s with CIDR %s", *subnetName, ipNet)
+			if *ipAddressAddFlag != "" && ipNet.Contains(net.ParseIP(*ipAddressAddFlag)) {
+				klog.Infof("Adding IP %s to node %s", *ipAddressAddFlag, *name)
+				assigned := "ASSIGNED"
+				nic.IPEndpointList = append(nic.IPEndpointList, &nutanixclientv3.IPAddress{
+					IP:   ipAddressAddFlag,
+					Type: &assigned,
+				})
+			}
+			if *ipAddressRemoveFlag != "" && ipNet.Contains(net.ParseIP(*ipAddressRemoveFlag)) {
+				klog.Infof("Removing IP %s to node %s", *ipAddressRemoveFlag, *name)
+				var newIPEndpointList []*nutanixclientv3.IPAddress
+				for _, ip := range nic.IPEndpointList {
+					if net.ParseIP(*ip.IP).Equal(net.ParseIP(*ipAddressRemoveFlag)) {
+						continue
+					}
+					newIPEndpointList = append(newIPEndpointList, ip)
+				}
+				nic.IPEndpointList = newIPEndpointList
+			}
 		}
-		/*
-			for _, nic := range vm.Status.Resources.NicList {
-				klog.Info(*nic)
-			}*/
+
+		if *ipAddressRemoveFlag != "" || *ipAddressAddFlag != "" {
+			var intent nutanixclientv3.VMIntentInput
+			intent.Metadata = vm.Metadata
+			intent.Spec = vm.Spec
+			/* intent.Spec = &nutanixclientv3.VM{}
+			intent.Spec.Name = name
+			intent.Spec.Resources = &nutanixclientv3.VMResources{}
+			intent.Spec.Resources.NicList = nicList*/
+			// Now, I run into: https://next.nutanix.com/how-it-works-22/updating-vm-via-prismcentral-v3-api-37435
+			res, err := client.V3.UpdateVM(*uuid, &intent)
+			if err != nil {
+				klog.Fatal(err)
+			}
+			resB, err := json.MarshalIndent(res, "", "    ")
+			if err != nil {
+				klog.Fatal(err)
+			}
+			klog.Infof("Update res: %s", resB)
+		}
 	}
 }
